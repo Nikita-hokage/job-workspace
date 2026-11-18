@@ -1,6 +1,8 @@
 import hashlib
 import json
 
+from .templates import find_template
+
 
 class Rejected(Exception):
     def __init__(self, message, *, status=400, code="invalid_request"):
@@ -89,7 +91,15 @@ def create_job(job_id, data, at):
         "updatedAt": at,
         "revision": 1,
     }
-    return job, event(job, "owner", "created", "Задача создана")
+    template_id = field(data, "templateId", "Шаблон", 64, optional=True)
+    detail = ""
+    if template_id:
+        template = find_template(template_id)
+        if template is None:
+            raise Rejected("Выберите доступный шаблон.", code="unknown_template")
+        job["planDraft"] = template["plan"]
+        detail = f"Шаблон «{template['name']}»"
+    return job, event(job, "owner", "created", "Задача создана", detail)
 
 
 def update_team(job, data, at):

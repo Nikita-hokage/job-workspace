@@ -7,6 +7,7 @@ from uuid import uuid4
 from job_workspace.demo import seed_demo
 from job_workspace.domain import Rejected
 from job_workspace.store import Store
+from job_workspace.templates import TEMPLATES
 
 
 PLAN = {"summary": "Update the introduction", "resources": ["docs/intro.md"], "criteria": ["Introduction links to the tutorial"]}
@@ -119,3 +120,30 @@ class WorkflowTests(unittest.TestCase):
         seed_demo(store)
         self.assertEqual(len(store.overview()["jobs"]), 3)
         self.assertEqual(store.overview()["jobs"][0]["stage"], "paused")
+
+    def test_templates_save_a_draft_without_approving_it(self):
+        for template in TEMPLATES:
+            with self.subTest(template=template["id"]):
+                operation_id = str(uuid4())
+                data = {"title": "Своё название", "brief": "Своя цель", "templateId": template["id"]}
+                job = self.store.create(operation_id, data)
+                restored = Store(self.path).detail(job["id"])
+                self.assertEqual(restored["job"]["title"], data["title"])
+                self.assertEqual(restored["job"]["planDraft"], template["plan"])
+                self.assertEqual(restored["job"]["stage"], "planning")
+                self.assertEqual(restored["job"]["plans"], [])
+                self.assertEqual(restored["job"]["planDecisions"], [])
+                self.assertEqual(self.store.create(operation_id, data), job)
+                self.assertEqual(len(restored["events"]), 1)
+                with self.assertRaises(Rejected) as error:
+                    self.store.apply(job["id"], str(uuid4()), job["revision"], "submit_review", RESULT)
+                self.assertEqual(error.exception.code, "wrong_stage")
+                job["planDraft"]["criteria"].append("Локальное изменение")
+                self.assertEqual(self.store.detail(job["id"])["job"]["planDraft"], template["plan"])
+
+    def test_unknown_template_does_not_create_a_job(self):
+        initial = self.store.overview()
+        with self.assertRaises(Rejected) as error:
+            self.store.create(str(uuid4()), {"title": "Test", "brief": "Test", "templateId": "missing"})
+        self.assertEqual(error.exception.code, "unknown_template")
+        self.assertEqual(self.store.overview(), initial)

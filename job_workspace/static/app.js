@@ -31,7 +31,7 @@ const paths = {
 const app = document.querySelector("#app");
 const dialog = document.querySelector("#dialog");
 const notice = document.querySelector("#notice");
-const state = { jobs: [], route: null, record: null, events: [], tab: "plan", filter: "all", query: "" };
+const state = { jobs: [], templates: [], route: null, record: null, events: [], tab: "plan", filter: "all", query: "" };
 let requestNumber = 0;
 let noticeTimer;
 const dayFormat = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short" });
@@ -125,7 +125,7 @@ function parseRoute() {
 async function refresh() {
   const request = ++requestNumber;
   try {
-    const { jobs } = await api("/api/jobs");
+    const [{ jobs }, { templates }] = await Promise.all([api("/api/jobs"), api("/api/templates")]);
     if (request !== requestNumber) return;
     let route = parseRoute();
     if (!route) {
@@ -146,7 +146,7 @@ async function refresh() {
     }
     if (request !== requestNumber) return;
     if (state.route?.view !== route.view || state.route?.id !== route.id) state.tab = "plan";
-    Object.assign(state, { jobs, route, record, events });
+    Object.assign(state, { jobs, templates, route, record, events });
     render();
   } catch (error) {
     if (request !== requestNumber) return;
@@ -285,7 +285,10 @@ function setTab(tab) {
 function jobPage({ job, events }) {
   return element("main", { class: "page" },
     element("header", { class: "page-heading" },
-      element("div", { class: "job-meta" }, element("span", { class: "job-code" }, job.code), status(job.stage)),
+      element("div", { class: "heading-toolbar" },
+        element("div", { class: "job-meta" }, element("span", { class: "job-code" }, job.code), status(job.stage)),
+        element("a", { class: "button secondary", href: "/api/jobs/" + job.id + "/export", download: job.code + ".md" },
+          icon("file"), "Скачать журнал")),
       element("h1", {}, job.title), element("p", { class: "page-intro multiline" }, job.brief)),
     progress(job.stage), currentAction(job),
     element("div", { class: "columns" }, jobPanel(job),
@@ -540,9 +543,21 @@ function command(job, kind, options, tab = state.tab) {
 }
 
 function createJob() {
+  const title = textField("title", "Название", { limit: 96 });
+  const brief = textField("brief", "Описание задачи", { multiline: true });
+  const titleInput = title.querySelector("input");
+  const briefInput = brief.querySelector("textarea");
+  let previousTemplate;
+  const chooser = element("select", { name: "templateId", onchange: (event) => {
+    const template = state.templates.find((item) => item.id === event.currentTarget.value);
+    if (!titleInput.value || titleInput.value === previousTemplate?.title) titleInput.value = template?.title || "";
+    if (!briefInput.value || briefInput.value === previousTemplate?.brief) briefInput.value = template?.brief || "";
+    previousTemplate = template;
+  } }, element("option", { value: "" }, "Пустая задача"), state.templates.map((item) =>
+    element("option", { value: item.id }, item.name)));
   showForm({
     title: "Новая задача", submit: "Создать задачу",
-    fields: [textField("title", "Название", { limit: 96 }), textField("brief", "Описание задачи", { multiline: true })],
+    fields: [element("label", { class: "field" }, "Шаблон", chooser), title, brief],
     save: (data, operationId) => api("/api/jobs", { data, operationId }),
     onSaved: async ({ job }) => {
       location.hash = "#job/" + job.id;
@@ -560,12 +575,13 @@ function editTeam(job) {
 
 function proposePlan(job) {
   const previous = job.plans.at(-1);
+  const draft = previous || job.planDraft;
   command(job, "propose_plan", {
     title: previous ? "Новая версия плана" : "Составить план", submit: "На согласование",
     fields: [
-      textField("summary", "План работы", { multiline: true, limit: 2400, value: previous?.summary }),
-      textField("resources", "Ресурсы", { multiline: true, limit: 3000, value: previous?.resources.join("\n"), hint: "По одному ресурсу на строку" }),
-      textField("criteria", "Критерии приёмки", { multiline: true, limit: 3000, value: previous?.criteria.join("\n"), hint: "По одному критерию на строку" }),
+      textField("summary", "План работы", { multiline: true, limit: 2400, value: draft?.summary }),
+      textField("resources", "Ресурсы", { multiline: true, limit: 3000, value: draft?.resources.join("\n"), hint: "По одному ресурсу на строку" }),
+      textField("criteria", "Критерии приёмки", { multiline: true, limit: 3000, value: draft?.criteria.join("\n"), hint: "По одному критерию на строку" }),
     ],
     collect: (data) => ({ ...data, resources: splitLines(data.resources), criteria: splitLines(data.criteria) }),
   });

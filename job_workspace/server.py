@@ -9,7 +9,9 @@ from urllib.parse import urlsplit
 
 from .demo import seed_demo
 from .domain import Rejected
+from .export import export_job
 from .store import Store
+from .templates import TEMPLATES
 
 
 STATIC = Path(__file__).with_name("static")
@@ -19,7 +21,7 @@ ASSETS = {
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
     "/favicon.png": ("favicon.png", "image/png"),
 }
-JOB_PATH = re.compile(r"/api/jobs/([1-9][0-9]{0,17})(/commands)?\Z")
+JOB_PATH = re.compile(r"/api/jobs/([1-9][0-9]{0,17})(/commands|/export)?\Z")
 MAX_BODY = 32 * 1024
 
 
@@ -38,10 +40,12 @@ class Handler(BaseHTTPRequestHandler):
         if format != '"%s" %s %s' or int(args[1]) >= 400:
             super().log_message(format, *args)
 
-    def respond(self, status, content_type, body):
+    def respond(self, status, content_type, body, *, attachment=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if attachment:
+            self.send_header("Content-Disposition", f'attachment; filename="{attachment}"')
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -110,6 +114,9 @@ class Handler(BaseHTTPRequestHandler):
         if not write and path == "/api/activity":
             self.json(store.activity())
             return
+        if not write and path == "/api/templates":
+            self.json({"templates": TEMPLATES})
+            return
         if path == "/api/jobs":
             if write:
                 payload = self.payload()
@@ -121,10 +128,17 @@ class Handler(BaseHTTPRequestHandler):
         match = JOB_PATH.fullmatch(path)
         if match:
             job_id = int(match[1])
-            if write and match[2]:
+            if write and match[2] == "/commands":
                 payload = self.payload()
                 store.apply(job_id, payload.get("operationId"), payload.get("revision"), payload.get("type"), payload["data"])
                 self.json(store.detail(job_id))
+                return
+            if not write and match[2] == "/export":
+                record = store.detail(job_id)
+                self.respond(
+                    HTTPStatus.OK, "text/markdown; charset=utf-8", export_job(record).encode("utf-8"),
+                    attachment=record["job"]["code"] + ".md",
+                )
                 return
             if not write and not match[2]:
                 self.json(store.detail(job_id))
