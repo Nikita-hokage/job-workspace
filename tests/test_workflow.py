@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -22,8 +23,8 @@ class WorkflowTests(unittest.TestCase):
         self.store = Store(self.path)
         self.job = self.store.create(str(uuid4()), {"title": "Docs refresh", "brief": "Improve onboarding"})
 
-    def command(self, kind, data, *, op_id=None):
-        self.job = self.store.apply(self.job["id"], op_id or str(uuid4()), self.job["revision"], kind, data)
+    def command(self, kind, data, *, op_id=None, at=None):
+        self.job = self.store.apply(self.job["id"], op_id or str(uuid4()), self.job["revision"], kind, data, at=at)
         return self.job
 
     def approve_plan(self):
@@ -147,3 +148,71 @@ class WorkflowTests(unittest.TestCase):
             self.store.create(str(uuid4()), {"title": "Test", "brief": "Test", "templateId": "missing"})
         self.assertEqual(error.exception.code, "unknown_template")
         self.assertEqual(self.store.overview(), initial)
+
+    def pending(self):
+        return self.store.overview()["jobs"][0]["pendingAction"]
+
+    def test_queue_tracks_only_the_current_plan_and_result(self):
+        self.assertIsNone(self.pending())
+        first = "2026-08-01T08:00:00+00:00"
+        second = "2026-08-02T12:00:00+00:00"
+        self.command("propose_plan", PLAN, at=first)
+        self.command("propose_plan", PLAN, at=second)
+        self.command("comment", {"role": "planner", "body": "Ready"})
+        self.assertEqual(self.pending(), {
+            "kind": "plan", "role": "owner", "context": "Версия плана 2", "since": second,
+        })
+        self.command("decide_plan", {"hash": self.job["plans"][-1]["hash"], "decision": "revise", "note": "More detail"})
+        self.assertIsNone(self.pending())
+        self.approve_plan()
+        self.assertIsNone(self.pending())
+        self.command("submit_review", RESULT)
+        self.command("decide_review", {"hash": self.job["submissions"][-1]["hash"], "decision": "revise", "note": "Add example"})
+        self.assertIsNone(self.pending())
+        self.command("submit_review", RESULT, at=second)
+        self.command("update_team", {**self.job["team"], "reviewer": "Анна"})
+        self.assertEqual(self.pending(), {
+            "kind": "review", "role": "reviewer", "context": "Версия результата 2", "since": second,
+        })
+        self.command("decide_review", {"hash": self.job["submissions"][-1]["hash"], "decision": "accept"})
+        self.assertIsNone(self.pending())
+
+    def test_effect_handoff_survives_restart_and_both_decisions(self):
+        self.approve_plan()
+        for value, label in (("approve", "Одобрено"), ("deny", "Отклонено")):
+            with self.subTest(decision=value):
+                requested = "2026-08-01T11:00:00+00:00"
+                decided = "2026-08-02T13:00:00+00:00"
+                self.command("request_effect", {"kind": "publish", "target": "docs/intro.md", "reason": "Publish"}, at=requested)
+                self.assertEqual(self.pending(), {"kind": "effect", "role": "owner", "since": requested,
+                                                  "context": "Публикация · docs/intro.md"})
+                effect_hash = self.job["effects"][-1]["hash"]
+                self.command("decide_effect", {"hash": effect_hash, "decision": value, "note": "Reviewed"}, at=decided)
+                self.store = Store(self.path)
+                self.assertEqual(self.pending(), {"kind": "resume", "role": "coder", "since": decided,
+                                                  "context": f"{label} · Публикация · docs/intro.md"})
+                self.command("resume_work", {"hash": effect_hash})
+                self.assertIsNone(self.pending())
+
+    def test_old_snapshot_and_three_role_client_keep_the_correct_owner(self):
+        self.command("propose_plan", PLAN)
+        job_id = self.job["id"]
+        del self.job["team"]["owner"]
+        legacy = json.dumps(self.job)
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE jobs SET snapshot = ? WHERE id = ?", (legacy, job_id))
+        self.store = Store(self.path)
+        before = self.store.detail(job_id)
+        self.assertEqual(before["job"]["team"]["owner"], "Владелец задачи")
+        self.assertEqual(self.store.overview()["jobs"][0]["team"], before["job"]["team"])
+        with self.store.connection() as db:
+            self.assertEqual(db.execute("SELECT snapshot FROM jobs WHERE id = ?", (job_id,)).fetchone()[0], legacy)
+
+        old_payload = self.job["team"].copy()
+        self.command("update_team", {**old_payload, "owner": "Мария"})
+        self.command("update_team", {**old_payload, "planner": "Ирина"})
+        self.assertEqual(self.job["team"]["owner"], "Мария")
+        self.command("decide_plan", {"hash": self.job["plans"][-1]["hash"], "decision": "approve"})
+        events = self.store.detail(job_id)["events"]
+        self.assertEqual([item["actor"] for item in events[:3]], ["Мария", "Мария", "Владелец задачи"])
+        self.assertEqual(events[3:], before["events"])

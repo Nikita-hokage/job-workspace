@@ -11,10 +11,13 @@ const stages = {
 const steps = ["Планирование", "Согласование", "Реализация", "Ревью", "Готово"];
 const stageIndex = { planning: 0, awaiting_plan: 1, implementation: 2, paused: 2, review: 3, done: 4 };
 const roles = { planner: "Планировщик", coder: "Исполнитель", reviewer: "Ревьюер", owner: "Владелец задачи" };
+const inboxRoles = { all: "Все роли", owner: roles.owner, coder: roles.coder, reviewer: roles.reviewer };
+const actionLabels = { plan: "Рассмотреть план", effect: "Рассмотреть запрос", resume: "Продолжить работу", review: "Проверить результат" };
 const effects = { publish: "Публикация", access: "Изменение доступа", delete: "Удаление данных", external: "Внешнее действие" };
 const paths = {
   logo: "M3 4h7v7H3zM14 4h7v7h-7zM3 15h7v5H3zM14 17.5l2 2 5-5",
   board: "M4 4h16v16H4zM4 10h16M10 10v10",
+  inbox: "M3 14l3-9h12l3 9v5H3zM3 14h5l2 3h4l2-3h5",
   clock: "M12 5v7l4 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z",
   help: "M9.5 9a2.5 2.5 0 1 1 3.4 2.3c-.6.3-.9.8-.9 1.7M12 16.5h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z",
   plus: "M12 5v14M5 12h14",
@@ -36,6 +39,7 @@ let requestNumber = 0;
 let noticeTimer;
 const dayFormat = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short" });
 const timeFormat = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" });
+const queueTimeFormat = new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" });
 
 function element(tag, attrs = {}, ...children) {
   const result = document.createElement(tag);
@@ -119,6 +123,8 @@ function parseRoute() {
   if (job && Number.isSafeInteger(Number(job[1]))) return { view: "job", id: Number(job[1]) };
   const activity = /^activity(?:\/([1-9][0-9]{0,17}))?$/.exec(hash);
   if (activity) return { view: "activity", id: activity[1] ? Number(activity[1]) : null };
+  const inbox = /^inbox(?:\/(owner|coder|reviewer))?$/.exec(hash);
+  if (inbox) return { view: "inbox", role: inbox[1] || "all" };
   return hash ? { view: "jobs" } : null;
 }
 
@@ -145,7 +151,9 @@ async function refresh() {
       ({ events } = await api("/api/activity"));
     }
     if (request !== requestNumber) return;
-    if (state.route?.view !== route.view || state.route?.id !== route.id) state.tab = "plan";
+    if (state.route?.view !== route.view || state.route?.id !== route.id) {
+      state.tab = ["review", "done"].includes(record?.job.stage) ? "results" : "plan";
+    }
     Object.assign(state, { jobs, templates, route, record, events });
     render();
   } catch (error) {
@@ -160,15 +168,16 @@ async function refresh() {
 
 function sidebar() {
   const { route, jobs } = state;
-  function link(label, symbol, target, current) {
+  function link(label, symbol, target, current, count) {
     return element("a", {
       href: target, class: "side-link" + (current ? " is-current" : ""), "aria-current": current ? "page" : null,
-    }, icon(symbol), label);
+    }, icon(symbol), label, count > 0 && element("span", { class: "nav-count" }, count));
   }
   return element("aside", { class: "sidebar" },
     element("a", { class: "brand", href: "#jobs" }, element("span", { class: "brand-mark" }, icon("logo")), "Job Workspace"),
     element("nav", { class: "side-nav", "aria-label": "Рабочее пространство" },
       link("Обзор", "board", "#jobs", route.view === "jobs"),
+      link("Очередь", "inbox", "#inbox", route.view === "inbox", jobs.filter((job) => job.pendingAction).length),
       link("Журнал", "clock", "#activity", route.view === "activity")),
     element("div", { class: "side-heading" }, "Задачи", element("span", { class: "count" }, jobs.length)),
     element("nav", { class: "side-jobs", "aria-label": "Последние задачи" },
@@ -185,8 +194,10 @@ function sidebar() {
 
 function render() {
   const job = state.record?.job;
-  const crumb = job ? job.code : state.route.view === "activity" ? "Журнал" : "Обзор";
-  const page = job ? jobPage(state.record) : state.route.view === "activity" ? activityPage() : overviewPage();
+  const sections = { jobs: "Обзор", activity: "Журнал", inbox: "Очередь" };
+  const pages = { jobs: overviewPage, activity: activityPage, inbox: inboxPage };
+  const crumb = job ? job.code : sections[state.route.view];
+  const page = job ? jobPage(state.record) : pages[state.route.view]();
   app.replaceChildren(element("div", { class: "shell" }, sidebar(),
     element("div", { class: "workspace" },
       element("header", { class: "topbar" },
@@ -194,7 +205,7 @@ function render() {
           element("a", { href: "#jobs" }, "Задачи"), icon("next"), element("span", { class: "current" }, crumb)),
         button("Новая задача", createJob, { symbol: "plus" })),
       page)));
-  document.title = job ? job.title + " · Job Workspace" : "Job Workspace";
+  document.title = (job ? job.title : crumb) + " · Job Workspace";
 }
 
 function progress(stage) {
@@ -448,6 +459,42 @@ function overviewPage() {
     element("div", { class: "board-tools" }, controls, search), board);
 }
 
+function inboxPage() {
+  const role = state.route.role;
+  const pending = state.jobs.filter((job) => job.pendingAction);
+  const visible = pending.filter((job) => role === "all" || job.pendingAction.role === role);
+  visible.sort((a, b) => Date.parse(a.pendingAction.since) - Date.parse(b.pendingAction.since) || a.id - b.id);
+  const filters = element("nav", { class: "filters", "aria-label": "Очередь по роли" },
+    Object.entries(inboxRoles).map(([key, label]) => element("a", {
+      class: "filter", href: key === "all" ? "#inbox" : "#inbox/" + key, "aria-current": role === key ? "page" : null,
+    }, label)));
+  const rows = visible.map((job) => {
+    const action = job.pendingAction;
+    const roleLabel = roles[action.role];
+    const name = job.team[action.role];
+    return element("li", {}, element("a", { class: "inbox-row", href: "#job/" + job.id },
+      element("div", { class: "inbox-task" },
+        element("span", { class: "job-code" }, job.code),
+        element("h2", {}, job.title),
+        element("p", { class: "body-copy" }, action.context)),
+      element("div", { class: "inbox-action" },
+        element("strong", {}, actionLabels[action.kind]),
+        element("span", {}, name === roleLabel ? roleLabel : roleLabel + " · " + name),
+        element("span", { class: "quiet" }, "В очереди с ",
+          element("time", { datetime: action.since }, queueTimeFormat.format(new Date(action.since))))),
+      icon("next")));
+  });
+  return element("main", { class: "page" },
+    element("header", { class: "page-heading" }, element("h1", {}, "Очередь действий"),
+      element("p", { class: "page-intro" }, "Сначала задачи, которые дольше всего ждут решения или продолжения работы.")),
+    element("div", { class: "board-tools" }, filters),
+    rows.length ? element("ol", { class: "panel inbox-list", "aria-label": "Ожидающие задачи" }, rows) :
+      element("section", { class: "panel padded blank" },
+        element("h2", {}, pending.length ? "Для этой роли действий нет" : "Очередь пуста"),
+        pending.length ? element("a", { class: "text-link", href: "#inbox" }, "Показать все роли") :
+          element("a", { class: "text-link", href: "#jobs" }, "Открыть обзор задач")));
+}
+
 function activityPage() {
   const job = state.jobs.find((entry) => entry.id === state.route.id);
   const events = job ? state.events.filter((entry) => entry.job_id === job.id) : state.events;
@@ -664,4 +711,7 @@ function addComment(job) {
 }
 
 window.addEventListener("hashchange", refresh);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && parseRoute()?.view === "inbox") refresh();
+});
 refresh();

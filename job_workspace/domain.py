@@ -73,7 +73,7 @@ def event(job, role, kind, title, detail=""):
 def create_job(job_id, data, at):
     title = field(data, "title", "Название", 96)
     brief = field(data, "brief", "Описание задачи", 1600)
-    team = {role: label for role, label in ROLES.items() if role != "owner"}
+    team = ROLES.copy()
     job = {
         "id": job_id,
         "code": f"JW-{job_id:03d}",
@@ -104,12 +104,36 @@ def create_job(job_id, data, at):
 
 def update_team(job, data, at):
     require_stage(job, "planning", "awaiting_plan", "implementation", "paused", "review")
-    team = {role: field(data, role, ROLES[role], 72) for role in job["team"]}
+    # Older clients submit only the original three roles.
+    assignments = {"owner": job["team"]["owner"], **data}
+    team = {role: field(assignments, role, label, 72) for role, label in ROLES.items()}
     if team["coder"].casefold() == team["reviewer"].casefold():
         raise Rejected("Исполнитель и ревьюер должны различаться.")
-    job["team"] = team
     detail = "\n".join(f"{ROLES[role]} — {name}" for role, name in team.items())
-    return event(job, "owner", "team", "Роли обновлены", detail)
+    change = event(job, "owner", "team", "Роли обновлены", detail)
+    job["team"] = team
+    return change
+
+
+def pending_action(job):
+    """The single workflow handoff currently waiting for a person."""
+    if job["stage"] == "awaiting_plan":
+        plan = job["plans"][-1]
+        return {"kind": "plan", "role": "owner", "since": plan["createdAt"],
+                "context": f"Версия плана {plan['version']}"}
+    if job["stage"] == "paused":
+        request = job["effects"][-1]
+        context = f"{EFFECTS[request['kind']]} · {request['target']}"
+        decision = request["decision"]
+        if decision is None:
+            return {"kind": "effect", "role": "owner", "since": request["requestedAt"], "context": context}
+        outcome = "Одобрено" if decision["value"] == "approve" else "Отклонено"
+        return {"kind": "resume", "role": "coder", "since": decision["at"], "context": f"{outcome} · {context}"}
+    if job["stage"] == "review":
+        result = job["submissions"][-1]
+        return {"kind": "review", "role": "reviewer", "since": result["submittedAt"],
+                "context": f"Версия результата {result['version']}"}
+    return None
 
 
 def propose_plan(job, data, at):
