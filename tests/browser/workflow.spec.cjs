@@ -1,5 +1,6 @@
 const { expect, test } = require("@playwright/test");
 const { readFile } = require("node:fs/promises");
+const { randomUUID } = require("node:crypto");
 
 function button(scope, name) {
   return scope.getByRole("button", { name, exact: true });
@@ -147,3 +148,79 @@ for (const template of [
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });
 }
+
+test("очередь направляет задачи владельцу, исполнителю и ревьюеру", async ({ page, request }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const dialog = page.getByRole("dialog");
+  const main = page.getByRole("main");
+  const plan = { summary: "Сверить инструкцию", resources: ["docs/start.md"], criteria: ["Команды проверены"] };
+  async function post(path, payload) {
+    const response = await request.post(path, { data: { ...payload, operationId: randomUUID() } });
+    expect(response.ok()).toBeTruthy();
+    return (await response.json()).job;
+  }
+  function command(job, type, data) {
+    return post("/api/jobs/" + job.id + "/commands", { revision: job.revision, type, data });
+  }
+  async function planned(title) {
+    const job = await post("/api/jobs", { data: { title, brief: "Проверить документацию" } });
+    return command(job, "propose_plan", plan);
+  }
+  const first = await planned("Согласовать выпуск памятки");
+  let second = await planned("Проверить новый раздел");
+  second = await command(second, "decide_plan", { hash: second.plans[0].hash, decision: "approve" });
+  await command(second, "submit_review", { summary: "Готов новый раздел", evidence: ["docs/start.md"] });
+
+  await page.goto("/#job/" + first.id);
+  await button(page, "Изменить роли").click();
+  await dialog.getByLabel("Владелец задачи").fill("Мария");
+  await dialog.getByLabel("Исполнитель").fill("Олег");
+  await button(dialog, "Сохранить").click();
+  await expect(page.getByText("Мария", { exact: true })).toBeVisible();
+  const nav = page.getByRole("navigation", { name: "Рабочее пространство" });
+  await nav.getByRole("link", { name: /^Очередь/ }).click();
+  const row = (job) => main.getByRole("link", { name: new RegExp(job.title) });
+  await expect(main.getByRole("listitem").first()).toContainText(first.title);
+  await expect(row(first)).toContainText("Владелец задачи · Мария");
+  await expect(row(second)).toContainText("Проверить результат");
+  await main.getByRole("link", { name: "Ревьюер", exact: true }).click();
+  await expect(row(first)).toHaveCount(0);
+  await page.reload();
+  await row(second).click();
+  await expect(main.getByRole("heading", { name: "Результат работы" })).toBeVisible();
+  await button(main, "Принять результат").click();
+  await button(dialog, "Принять и завершить").click();
+  await expect(main.getByText("Завершена", { exact: true })).toBeVisible();
+  await page.goBack();
+  await expect(page).toHaveURL(/#inbox\/reviewer$/);
+  await expect(main.getByRole("heading", { name: "Для этой роли действий нет" })).toBeVisible();
+  await main.getByRole("link", { name: "Показать все роли" }).click();
+
+  await row(first).click();
+  await button(main, "Одобрить план").click();
+  await button(dialog, "Одобрить версию").click();
+  await button(main, "Запросить одобрение").click();
+  await dialog.getByLabel("Тип действия").selectOption("publish");
+  await dialog.getByLabel("Ресурс").selectOption("docs/start.md");
+  await dialog.getByLabel("Описание действия").fill("Опубликовать памятку");
+  await button(dialog, "Запросить одобрение").click();
+  await expect(main.getByRole("heading", { name: "Ожидается одобрение действия" })).toBeVisible();
+  await nav.getByRole("link", { name: /^Очередь/ }).click();
+  await expect(row(first)).toContainText("Рассмотреть запрос");
+  await row(first).click();
+  await button(main, "Рассмотреть запрос").click();
+  await dialog.getByLabel("Решение").selectOption("approve");
+  await button(dialog, "Записать решение").click();
+  await expect(main.getByRole("heading", { name: "Действие одобрено", exact: true })).toBeVisible();
+  await page.goBack();
+  await main.getByRole("link", { name: "Исполнитель", exact: true }).click();
+  await expect(row(first)).toContainText("Исполнитель · Олег");
+  await expect(row(first)).toContainText("Продолжить работу");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await row(first).click();
+  await button(main, "Продолжить работу").click();
+  await button(dialog, "Продолжить").click();
+  await expect(main.getByRole("heading", { name: "Работа по согласованному плану" })).toBeVisible();
+  await page.goBack();
+  await expect(main.getByRole("heading", { name: "Очередь пуста" })).toBeVisible();
+});

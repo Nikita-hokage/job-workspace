@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 from uuid import UUID
 
-from .domain import COMMANDS, Rejected, create_job, digest
+from .domain import COMMANDS, ROLES, Rejected, create_job, digest, pending_action
 
 
 SCHEMA = """
@@ -47,6 +47,12 @@ def operation_id(value):
         raise Rejected("Идентификатор операции должен быть UUID.") from exc
 
 
+def load_snapshot(snapshot):
+    job = json.loads(snapshot)
+    job["team"].setdefault("owner", ROLES["owner"])
+    return job
+
+
 class Store:
     def __init__(self, path):
         self.path = Path(path)
@@ -77,7 +83,7 @@ class Store:
         row = db.execute("SELECT snapshot FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if row is None:
             raise Rejected("Задача не найдена.", status=404, code="not_found")
-        return json.loads(row["snapshot"])
+        return load_snapshot(row["snapshot"])
 
     @staticmethod
     def _receipt(db, op_id, fingerprint):
@@ -147,9 +153,14 @@ class Store:
     def overview(self):
         with self.connection() as db:
             db.execute("BEGIN")
-            jobs = [json.loads(row["snapshot"]) for row in db.execute("SELECT snapshot FROM jobs ORDER BY updated_at DESC, id DESC")]
             fields = ("id", "code", "title", "brief", "stage", "team", "updatedAt")
-            return {"jobs": [{key: job[key] for key in fields} for job in jobs]}
+            summaries = []
+            for row in db.execute("SELECT snapshot FROM jobs ORDER BY updated_at DESC, id DESC"):
+                job = load_snapshot(row["snapshot"])
+                summary = {key: job[key] for key in fields}
+                summary["pendingAction"] = pending_action(job)
+                summaries.append(summary)
+            return {"jobs": summaries}
 
     def activity(self):
         with self.connection() as db:
