@@ -1,4 +1,5 @@
 const { expect, test } = require("@playwright/test");
+const { readFile } = require("node:fs/promises");
 
 function button(scope, name) {
   return scope.getByRole("button", { name, exact: true });
@@ -99,3 +100,50 @@ test("задача проходит от плана до приёмки посл
     }
   });
 });
+
+for (const template of [
+  { id: "documentation", name: "Обновление документации", title: "Обновить руководство по установке", resource: "docs/install.md" },
+  { id: "onboarding", name: "Онбординг команды", title: "Обновить онбординг команды", resource: "Чек-лист первого дня" },
+  { id: "release", name: "Подготовка релиза", title: "Подготовить выпуск новой версии", resource: "CHANGELOG.md" },
+]) {
+  test("шаблон «" + template.name + "» сохраняет черновик и позволяет скачать журнал", async ({ page }) => {
+    const dialog = page.getByRole("dialog");
+    if (template.id === "onboarding") await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    await button(page, "Новая задача").click();
+    await dialog.getByLabel("Шаблон").selectOption(template.id);
+    await expect(dialog.getByLabel("Название", { exact: true })).toHaveValue(template.title);
+
+    const title = "Мой проект — " + template.name;
+    await dialog.getByLabel("Название", { exact: true }).fill(title);
+    await dialog.getByLabel("Шаблон").selectOption("");
+    await expect(dialog.getByLabel("Название", { exact: true })).toHaveValue(title);
+    await dialog.getByLabel("Шаблон").selectOption(template.id);
+    await expect(dialog.getByLabel("Название", { exact: true })).toHaveValue(title);
+    await button(dialog, "Создать задачу").click();
+    await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
+    const jobUrl = page.url();
+    await page.reload();
+    await button(page, "Составить план").click();
+    await expect(dialog.getByLabel("План работы")).not.toHaveValue("");
+    await expect(dialog.getByLabel("Ресурсы")).toHaveValue(new RegExp(template.resource.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    await expect(dialog.getByLabel("Критерии приёмки")).not.toHaveValue("");
+    await button(dialog, "На согласование").click();
+    await button(page, "Одобрить план").click();
+    await button(dialog, "Одобрить версию").click();
+    await expect(page.getByRole("heading", { name: "Согласованный план" })).toBeVisible();
+
+    const downloadPromise = page.waitForEvent("download");
+    await page.getByRole("link", { name: "Скачать журнал", exact: true }).click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toMatch(/^JW-\d+\.md$/);
+    expect(await download.failure()).toBeNull();
+    const text = await readFile(await download.path(), "utf8");
+    expect(text).toContain(title);
+    expect(text).toContain("**Решение** Одобрен");
+    expect(text).toContain("## Журнал событий");
+    await expect(page).toHaveURL(jobUrl);
+    await expect(page.getByRole("heading", { name: "Согласованный план" })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  });
+}
